@@ -13,8 +13,10 @@ from rerank_tot_candidats import rerank
 
 DEFAULT_INPUT = Path("data/runs/llama31_8b_staged_tot_requests_lit_arts_en.jsonl")
 DEFAULT_OUTPUT = Path("data/runs/llama31_8b_staged_tot_outputs_lit_arts_en.jsonl")
+DEFAULT_GENERATION_MODEL = "llama3.1:8b"
+DEFAULT_JUDGE_MODEL = "qwen2.5:14b-instruct-q4_K_M"
 HF_TO_OLLAMA_MODEL = {
-    "meta-llama/Meta-Llama-3.1-8B-Instruct": "llama3.1:8b",
+    "meta-llama/Meta-Llama-3.1-8B-Instruct": DEFAULT_GENERATION_MODEL,
 }
 DRAFT_FORMAT_INSTRUCTIONS = """
 
@@ -38,9 +40,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
-        "--model",
-        default=None,
-        help="Ollama model tag. Defaults to request model mapped to llama3.1:8b.",
+        "--generation-model",
+        default=DEFAULT_GENERATION_MODEL,
+        help="Ollama model tag for constraint mapping, branch expansion, drafting, and final revision.",
+    )
+    parser.add_argument(
+        "--judge-model",
+        default=DEFAULT_JUDGE_MODEL,
+        help="Ollama model tag for LLM judging.",
     )
     parser.add_argument(
         "--ollama-url",
@@ -87,7 +94,7 @@ def resolve_model(request_model: Optional[str], cli_model: Optional[str]) -> str
         return cli_model
     if request_model in HF_TO_OLLAMA_MODEL:
         return HF_TO_OLLAMA_MODEL[request_model]
-    return request_model or "llama3.1:8b"
+    return request_model or DEFAULT_GENERATION_MODEL
 
 
 def extract_json(text: str) -> Any:
@@ -220,7 +227,8 @@ def find_by_branch_id(items: list[Any], branch_id: Any) -> Optional[Any]:
 
 def run_record(
     record: dict[str, Any],
-    model: str,
+    generation_model: str,
+    judge_model: str,
     ollama_url: str,
     temperature: float,
     judge_temperature: float,
@@ -236,7 +244,7 @@ def run_record(
     print(f"  - map constraints for index={record.get('index')}", flush=True)
     constraint_map = ollama_chat(
         ollama_url,
-        model,
+        generation_model,
         stages["constraint_map"]["system"],
         stages["constraint_map"]["user"],
         temperature,
@@ -251,7 +259,7 @@ def run_record(
     )
     branch_expansion = ollama_chat(
         ollama_url,
-        model,
+        generation_model,
         stages["expand_branches"]["system"],
         expand_user,
         temperature,
@@ -297,7 +305,7 @@ def run_record(
                 )
             candidate = ollama_chat(
                 ollama_url,
-                model,
+                generation_model,
                 stages["draft_branch"]["system"],
                 draft_user if attempt == 0 else draft_user + build_retry_instruction(errors),
                 temperature if attempt == 0 else min(temperature, 0.3),
@@ -329,7 +337,7 @@ def run_record(
         )
         judgment = ollama_chat(
             ollama_url,
-            model,
+            judge_model,
             stages["judge_branch"]["system"],
             judge_user,
             judge_temperature,
@@ -350,7 +358,7 @@ def run_record(
         )
 
     print("  - revise selected candidate", flush=True)
-    final_stage = stages.get("final_revision") or stages.get("synthesize")
+    final_stage = stages["final_revision"]
     synth_user = fill_template(
         final_stage["user_template"],
         {
@@ -363,7 +371,7 @@ def run_record(
     )
     final = ollama_chat(
         ollama_url,
-        model,
+        generation_model,
         final_stage["system"],
         synth_user,
         temperature,
@@ -373,7 +381,8 @@ def run_record(
 
     return {
         "index": record.get("index"),
-        "model": model,
+        "generation_model": generation_model,
+        "judge_model": judge_model,
         "branch_count": record.get("branch_count"),
         "constraint_map": constraint_map,
         "branch_expansion": branch_expansion,
@@ -404,11 +413,16 @@ def main() -> None:
         args.output.unlink()
 
     for i, record in enumerate(records, 1):
-        model = resolve_model(record.get("model"), args.model)
-        print(f"[{i}/{len(records)}] index={record.get('index')} model={model}")
+        generation_model = resolve_model(record.get("model"), args.generation_model)
+        judge_model = args.judge_model
+        print(
+            f"[{i}/{len(records)}] index={record.get('index')} "
+            f"generation_model={generation_model} judge_model={judge_model}"
+        )
         result = run_record(
             record,
-            model,
+            generation_model,
+            judge_model,
             args.ollama_url,
             args.temperature,
             args.judge_temperature,

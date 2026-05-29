@@ -19,9 +19,7 @@ LLAMA31_8B_INSTRUCT = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
 TOT_SYSTEM_PROMPT = """You are a creative-writing Tree-of-Thought controller.
 Use visible, concise deliberation artifacts only: constraint maps, branch plans,
-rubric scores, and revision notes. Do not reveal hidden chain-of-thought.
-During generation stages, follow only the user's query and extracted constraints.
-Use the WritingBench checklist only when explicitly asked to judge or audit."""
+rubric scores, and revision notes. Do not reveal hidden chain-of-thought."""
 
 
 CONSTRAINT_MAP_SCHEMA: dict[str, Any] = {
@@ -43,6 +41,12 @@ BRANCH_EXPANSION_SCHEMA: dict[str, Any] = {
             "narrative_architecture": "...",
             "voice_or_perspective": "...",
             "development_path": "...",
+            "constraint_coverage": [
+                {
+                    "requirement": "...",
+                    "plan": "...",
+                }
+            ],
             "distinctive_material": "...",
             "risk": "...",
         }
@@ -82,25 +86,6 @@ FINAL_REVISION_SCHEMA: dict[str, Any] = {
 }
 
 
-EXPECTED_SINGLE_CALL_SCHEMA: dict[str, Any] = {
-    "constraint_map": CONSTRAINT_MAP_SCHEMA,
-    "branches": BRANCH_EXPANSION_SCHEMA["branches"],
-    "candidates": [
-        {
-            "branch_id": "A",
-            "candidate_answer": "...",
-            "self_check_notes": ["..."],
-        }
-    ],
-    "judgments": [JUDGE_OUTPUT_SCHEMA],
-    "selection": {
-        "selected_branch_id": "A",
-        "rationale": "Brief rubric-grounded reason, not private reasoning.",
-    },
-    "final_revision": FINAL_REVISION_SCHEMA,
-}
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create ToT prompt requests from the Lit & Arts EN test set."
@@ -133,15 +118,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional model identifier to include in each request spec.",
     )
     parser.add_argument(
-        "--mode",
-        choices=("single-call", "staged"),
-        default="single-call",
-        help=(
-            "single-call emits one complete ToT prompt per query; staged emits "
-            "an orchestration spec with separate expansion/draft/judge/synthesis prompts."
-        ),
-    )
-    parser.add_argument(
         "--branch-count",
         type=int,
         default=4,
@@ -171,18 +147,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Zero-based offset in the input file.",
     )
-    parser.add_argument(
-        "--include-checklist-json",
-        action="store_true",
-        help="Use full rubric JSON for single-call mode. Staged judging always uses the full checklist.",
-    )
     return parser.parse_args()
 
 
 def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
     if args.preset == "llama31-8b-staged":
         args.model = args.model or LLAMA31_8B_INSTRUCT
-        args.mode = "staged"
         args.judge_mode = "simple"
         args.rerank = "programmatic"
     return args
@@ -202,64 +172,9 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def compact_checklist(entry: dict[str, Any]) -> list[dict[str, str]]:
-    checklist = entry.get("checklist", [])
-    return [
-        {
-            "name": str(item.get("name", "")),
-            "criteria_description": str(item.get("criteria_description", "")),
-            "excellent_band": str(item.get("9-10", "")),
-        }
-        for item in checklist
-    ]
-
-
-def checklist_payload(entry: dict[str, Any], include_full: bool) -> Any:
-    if include_full:
-        return entry.get("checklist", [])
-    return compact_checklist(entry)
-
-
-def build_single_call_user_prompt(
-    entry: dict[str, Any],
-    branch_count: int,
-    include_full_checklist: bool,
-) -> str:
-    payload = {
-        "query_id": entry.get("index"),
-        "domain": entry.get("domain1"),
-        "subdomain": entry.get("domain2"),
-        "language": entry.get("lang"),
-        "query": entry.get("query"),
-        "checklist": entry.get("checklist", []),
-        "branch_count": branch_count,
-    }
-    return f"""Run a lightweight Tree-of-Thought creative-writing pass.
-
-Process:
-1. Build a concise constraint map from the query only. Do not use the checklist.
-2. Propose exactly {branch_count} complete creative branches. Each branch must be
-   a different narrative architecture, not a checklist dimension.
-3. Draft one complete candidate answer per branch using only the query,
-   constraint map, and that branch.
-4. Use the full checklist only now: judge each candidate and identify constraint
-   violations.
-5. Select the best candidate by constraint violations, min score, then mean score.
-6. Revise only the selected candidate using its own judge feedback. Do not blend
-   material from other candidates.
-
-Output valid JSON matching this shape:
-{json.dumps(EXPECTED_SINGLE_CALL_SCHEMA, ensure_ascii=False, indent=2)}
-
-Input:
-{json.dumps(payload, ensure_ascii=False, indent=2)}
-"""
-
-
 def build_staged_spec(
     entry: dict[str, Any],
     branch_count: int,
-    include_full_checklist: bool,
     judge_mode: str,
 ) -> dict[str, Any]:
     generation_payload = {
@@ -280,9 +195,9 @@ def build_staged_spec(
         "constraint_map": {
             "system": TOT_SYSTEM_PROMPT,
             "user": f"""Extract a concise constraint map from the user's creative-writing query only.
-Do not use or infer from any WritingBench checklist. Separate explicit
-requirements from avoidances, style, structure, ambiguities, and likely failure
-modes. Return exactly one JSON object matching this example shape:
+Separate explicit requirements from avoidances, style, structure, ambiguities,
+and likely failure modes. Return exactly one JSON object matching this example
+shape:
 {json.dumps(CONSTRAINT_MAP_SCHEMA, ensure_ascii=False, indent=2)}
 
 Input:
@@ -292,9 +207,13 @@ Input:
         "expand_branches": {
             "system": TOT_SYSTEM_PROMPT,
             "user_template": f"""Create exactly {branch_count} complete creative branches.
-Each branch must be a different narrative architecture, not a different
-checklist/rubric dimension. Do not score branches. Do not mention checklist
-coverage. Keep each branch compact but complete enough to guide drafting.
+Each branch must be a complete solution path for the original task. Each branch
+must cover every item in constraint_map.must_include, and constraint_coverage
+must name each required item with a concrete plan for satisfying it. Do not split
+required elements across separate branches: every branch must handle the whole
+task. The branches must be genuinely different narrative architectures, not
+minor variations or different evaluation dimensions. Do not score branches. Keep
+each branch compact but complete enough to guide drafting.
 
 Return exactly one JSON object matching this example shape:
 {json.dumps(BRANCH_EXPANSION_SCHEMA, ensure_ascii=False, indent=2)}
@@ -309,9 +228,10 @@ Constraint map:
         "draft_branch": {
             "system": TOT_SYSTEM_PROMPT,
             "user_template": f"""Write one candidate answer for the selected branch.
-Respect the original user query and the constraint map. Use the branch plan as
-the narrative architecture, not as text to copy. Do not use any WritingBench
-checklist or rubric during drafting.
+Respect the original user query and the constraint map. Visibly execute the
+selected branch's narrative_architecture. Do not fall back to a generic outline
+or generic answer pattern. Use the branch's distinctive_material and follow its
+development_path as the organizing logic for the candidate.
 
 Return exactly one JSON object with only these keys:
 branch_id, candidate_answer, self_check_notes.
@@ -358,7 +278,7 @@ Return exactly one JSON object matching this example shape:
 The final_answer must be directly usable by the original user.
 
 Original input:
-{judge_json}
+{generation_json}
 
 Constraint map:
 {{constraint_map_json}}
@@ -381,9 +301,7 @@ Selected candidate:
 
 def build_request(
     entry: dict[str, Any],
-    mode: str,
     branch_count: int,
-    include_full_checklist: bool,
     model: Optional[str],
     judge_mode: str,
     rerank: str,
@@ -395,26 +313,10 @@ def build_request(
         "lang": entry.get("lang"),
         "query": entry.get("query"),
         "branch_count": branch_count,
-        "mode": mode,
-        "checklist_mode": "full" if include_full_checklist else "compact",
+        "mode": "staged",
         "judge_checklist_mode": "full",
         "model": model,
     }
-
-    if mode == "single-call":
-        common["messages"] = [
-            {"role": "system", "content": TOT_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": build_single_call_user_prompt(
-                    entry,
-                    branch_count,
-                    include_full_checklist,
-                ),
-            },
-        ]
-        common["expected_output_schema"] = EXPECTED_SINGLE_CALL_SCHEMA
-        return common
 
     common["judge_mode"] = judge_mode
     if rerank == "programmatic":
@@ -439,7 +341,6 @@ def build_request(
     common["stages"] = build_staged_spec(
         entry,
         branch_count,
-        include_full_checklist,
         judge_mode,
     )
     return common
@@ -471,9 +372,7 @@ def main() -> None:
     requests = [
         build_request(
             entry=entry,
-            mode=args.mode,
             branch_count=args.branch_count,
-            include_full_checklist=args.include_checklist_json,
             model=args.model,
             judge_mode=args.judge_mode,
             rerank=args.rerank,
@@ -483,7 +382,7 @@ def main() -> None:
     write_jsonl(requests, args.output)
 
     if str(args.output) != "-":
-        print(f"Wrote {len(requests)} ToT {args.mode} request(s) to: {args.output}")
+        print(f"Wrote {len(requests)} ToT staged request(s) to: {args.output}")
 
 
 if __name__ == "__main__":
