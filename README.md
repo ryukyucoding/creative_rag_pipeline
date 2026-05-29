@@ -236,7 +236,9 @@ runner 會檢查：
 
 ### 4. judge_branch
 
-目的：用完整 WritingBench checklist 評估每個 candidate。這是唯一會收到 checklist 的 stage。
+目的：用 WritingBench checklist 評估每個 candidate。這是唯一會收到 checklist 的 stage。
+
+`build_tot_requests.py` 的 `JUDGE_CHECKLIST_MODE` 預設是 `"compact"`，judge input 只放每個 criterion 的 `name` 和 `criteria_description`，降低 prompt 長度和 OOM 風險；需要完整 1-10 分數段描述時可改成 `"full"`。
 
 模型只負責判斷，不負責計算 aggregate metrics。
 
@@ -378,6 +380,12 @@ runner 會檢查 final：
 | Ollama model、temperature、timeout、retry 次數 | `scripts/run_tot_ollama.py` 頂部全域參數 |
 | 測試題目資料 | `data/test_set/test_set_lit_arts_en.jsonl` |
 | 原始資料說明 | `docs/DATA_README.md` |
+
+## RATT-inspired 設計說明
+
+參考 RATT 的多分支探索概念，但針對 creative writing 任務進行簡化與改造。系統並不是直接針對 WritingBench query 生成單一答案，而是先從原始題目中抽取 constraint map，整理任務必須滿足的內容、格式、風格與可能失敗模式。接著，系統會展開多個 creative branches，每個 branch 都代表一條完整的敘事架構或創作路徑。
+
+目前版本可以視為一個 lightweight / single-round 的 RATT-inspired multi-branch creative generation pipeline。它保留了 RATT 中「多路徑探索、分支評估、選擇較佳分支」的精神，未實作 RATT 的多輪迭代、節點整合與 retrieval-based correction。後續版本可以加入 Creative Association RAG，讓部分 branch 檢索中距離相關的靈感知識，用於提升文本的新穎性、隱喻性與創意轉換能力。
 
 ## 引用
 

@@ -21,6 +21,7 @@ BRANCH_COUNT = 3
 TARGET_INDEX = 180
 
 JUDGE_MODE = "simple"
+JUDGE_CHECKLIST_MODE = "compact"
 
 
 TOT_SYSTEM_PROMPT = """You are a creative-writing Tree-of-Thought controller.
@@ -108,6 +109,52 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def compact_checklist(checklist: Any) -> list[dict[str, Any]]:
+    """Keep only rubric names and descriptions to reduce judge prompt size."""
+    if not isinstance(checklist, list):
+        return []
+
+    compact: list[dict[str, Any]] = []
+    for item in checklist:
+        if not isinstance(item, dict):
+            continue
+        compact.append(
+            {
+                "name": item.get("name", ""),
+                "criteria_description": item.get("criteria_description", ""),
+            }
+        )
+    return compact
+
+
+def checklist_for_judge(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    checklist = entry.get("checklist", [])
+    if JUDGE_CHECKLIST_MODE == "full":
+        return checklist if isinstance(checklist, list) else []
+    if JUDGE_CHECKLIST_MODE == "compact":
+        return compact_checklist(checklist)
+    raise ValueError(
+        "JUDGE_CHECKLIST_MODE must be either 'full' or 'compact', "
+        f"got {JUDGE_CHECKLIST_MODE!r}"
+    )
+
+
+def judge_checklist_instruction() -> str:
+    if JUDGE_CHECKLIST_MODE == "full":
+        return "Use the full WritingBench checklist below to score each criterion from 1 to 10."
+    if JUDGE_CHECKLIST_MODE == "compact":
+        return (
+            "Use the compact WritingBench checklist below to score each criterion "
+            "from 1 to 10. The checklist includes only each criterion's name and "
+            "description, so calibrate scores from the description rather than "
+            "score-band text."
+        )
+    raise ValueError(
+        "JUDGE_CHECKLIST_MODE must be either 'full' or 'compact', "
+        f"got {JUDGE_CHECKLIST_MODE!r}"
+    )
+
+
 def build_staged_spec(entry: dict[str, Any]) -> dict[str, Any]:
     generation_payload = {
         "query_id": entry.get("index"),
@@ -118,7 +165,8 @@ def build_staged_spec(entry: dict[str, Any]) -> dict[str, Any]:
     }
     judge_payload = {
         **generation_payload,
-        "checklist": entry.get("checklist", []),
+        "checklist_mode": JUDGE_CHECKLIST_MODE,
+        "checklist": checklist_for_judge(entry),
     }
     generation_json = json.dumps(generation_payload, ensure_ascii=False, indent=2)
     judge_json = json.dumps(judge_payload, ensure_ascii=False, indent=2)
@@ -186,8 +234,9 @@ Branch plan:
         "judge_branch": {
             "system": TOT_SYSTEM_PROMPT,
             "judge_mode": JUDGE_MODE,
+            "checklist_mode": JUDGE_CHECKLIST_MODE,
             "user_template": f"""Use a simple rubric judge for one candidate answer.
-Use the full WritingBench checklist below to score each criterion from 1 to 10.
+{judge_checklist_instruction()}
 Also score branch_fidelity from 1 to 5: how faithfully the candidate executes
 its selected branch plan rather than falling back to a generic answer pattern.
 Check constraint violations against the original query requirements. Keep the
@@ -249,7 +298,7 @@ def build_request(entry: dict[str, Any]) -> dict[str, Any]:
         "query": entry.get("query"),
         "branch_count": BRANCH_COUNT,
         "mode": "staged",
-        "judge_checklist_mode": "full",
+        "judge_checklist_mode": JUDGE_CHECKLIST_MODE,
         "model": MODEL,
     }
 
