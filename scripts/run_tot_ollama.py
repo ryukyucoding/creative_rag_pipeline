@@ -207,6 +207,17 @@ def build_retry_instruction(errors: list[str]) -> str:
     )
 
 
+def same_branch_id(left: Any, right: Any) -> bool:
+    return str(left) == str(right)
+
+
+def find_by_branch_id(items: list[Any], branch_id: Any) -> Optional[Any]:
+    for item in items:
+        if isinstance(item, dict) and same_branch_id(item.get("branch_id") or item.get("id"), branch_id):
+            return item
+    return None
+
+
 def run_record(
     record: dict[str, Any],
     model: str,
@@ -222,18 +233,33 @@ def run_record(
         raise ValueError("run_tot_ollama.py only supports staged request specs.")
 
     stages = record["stages"]
-    print(f"  - expand branches for index={record.get('index')}", flush=True)
-    expand = ollama_chat(
+    print(f"  - map constraints for index={record.get('index')}", flush=True)
+    constraint_map = ollama_chat(
         ollama_url,
         model,
-        stages["expand"]["system"],
-        stages["expand"]["user"],
+        stages["constraint_map"]["system"],
+        stages["constraint_map"]["user"],
         temperature,
         num_ctx,
         timeout,
     )
 
-    branches = expand.get("branches", [])
+    print(f"  - expand branches for index={record.get('index')}", flush=True)
+    expand_user = fill_template(
+        stages["expand_branches"]["user_template"],
+        {"constraint_map_json": constraint_map},
+    )
+    branch_expansion = ollama_chat(
+        ollama_url,
+        model,
+        stages["expand_branches"]["system"],
+        expand_user,
+        temperature,
+        num_ctx,
+        timeout,
+    )
+
+    branches = branch_expansion.get("branches", [])
     if not isinstance(branches, list) or not branches:
         raise ValueError(f"No branches returned for index={record.get('index')}")
 
@@ -254,7 +280,10 @@ def run_record(
         draft_user = (
             fill_template(
                 stages["draft_branch"]["user_template"],
-                {"branch_plan_json": branch},
+                {
+                    "constraint_map_json": constraint_map,
+                    "branch_plan_json": branch,
+                },
             )
             + DRAFT_FORMAT_INSTRUCTIONS
         )
@@ -311,19 +340,31 @@ def run_record(
 
     print("  - rerank candidates", flush=True)
     rerank_result = rerank(judgments)
-    print("  - synthesize final answer", flush=True)
+    selected_branch_id = rerank_result.get("selected_branch_id")
+    selected_candidate = find_by_branch_id(candidates, selected_branch_id)
+    selected_judgment = find_by_branch_id(judgments, selected_branch_id)
+    selected_branch = find_by_branch_id(selected_branches, selected_branch_id)
+    if selected_candidate is None or selected_judgment is None:
+        raise ValueError(
+            f"Could not resolve selected branch {selected_branch_id!r} for index={record.get('index')}"
+        )
+
+    print("  - revise selected candidate", flush=True)
+    final_stage = stages.get("final_revision") or stages.get("synthesize")
     synth_user = fill_template(
-        stages["synthesize"]["user_template"],
+        final_stage["user_template"],
         {
+            "constraint_map_json": constraint_map,
             "rerank_result_json": rerank_result,
-            "judgments_json": judgments,
-            "candidates_json": candidates,
+            "selected_branch_json": selected_branch,
+            "selected_judgment_json": selected_judgment,
+            "selected_candidate_json": selected_candidate,
         },
     )
     final = ollama_chat(
         ollama_url,
         model,
-        stages["synthesize"]["system"],
+        final_stage["system"],
         synth_user,
         temperature,
         num_ctx,
@@ -334,11 +375,15 @@ def run_record(
         "index": record.get("index"),
         "model": model,
         "branch_count": record.get("branch_count"),
-        "expand": expand,
+        "constraint_map": constraint_map,
+        "branch_expansion": branch_expansion,
         "candidates": candidates,
         "judgments": judgments,
         "candidate_retry_notes": candidate_retry_notes,
         "rerank_result": rerank_result,
+        "selected_branch": selected_branch,
+        "selected_candidate": selected_candidate,
+        "selected_judgment": selected_judgment,
         "final": final,
     }
 
