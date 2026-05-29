@@ -1,20 +1,26 @@
 """Build Tree-of-Thought prompt requests for creative-writing evaluation.
 
-The script is intentionally provider-neutral: it emits JSONL request/spec
-objects that can be consumed by an OpenAI-compatible runner, a vLLM batch
-runner, or a custom orchestration script.
+Edit the global configuration block below to choose the model, branch count,
+and WritingBench test-set index. The script writes one staged request JSONL file
+under data/runs/ using the selected index and current timestamp.
 """
 
-import argparse
 import json
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_INPUT = ROOT / "data" / "test_set" / "test_set_lit_arts_en.jsonl"
-DEFAULT_OUTPUT = ROOT / "data" / "runs" / "tot_requests_lit_arts_en.jsonl"
-LLAMA31_8B_INSTRUCT = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+INPUT_PATH = ROOT / "data" / "test_set" / "test_set_lit_arts_en.jsonl"
+RUNS_DIR = ROOT / "data" / "runs"
+
+# Edit these values when you want to generate a different request file.
+MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+BRANCH_COUNT = 3
+TARGET_INDEX = 180
+
+JUDGE_MODE = "simple"
 
 
 TOT_SYSTEM_PROMPT = """You are a creative-writing Tree-of-Thought controller.
@@ -64,11 +70,13 @@ JUDGE_OUTPUT_SCHEMA: dict[str, Any] = {
             "main_issue": "...",
         }
     ],
-    "mean_score": 0.0,
-    "min_score": 0,
-    "constraint_violations": ["..."],
-    "strengths": ["..."],
-    "fixable_issues": ["..."],
+    "branch_fidelity": {
+        "score_1_to_5": 0,
+        "evidence": "...",
+        "main_issue": "...",
+    },
+    "constraint_violations": [],
+    "top_fix": "...",
 }
 
 
@@ -86,78 +94,6 @@ FINAL_REVISION_SCHEMA: dict[str, Any] = {
 }
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Create ToT prompt requests from the Lit & Arts EN test set."
-    )
-    parser.add_argument(
-        "--input",
-        type=Path,
-        default=DEFAULT_INPUT,
-        help="Path to WritingBench-style JSONL test set.",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=DEFAULT_OUTPUT,
-        help="Output JSONL path. Use '-' to print to stdout.",
-    )
-    parser.add_argument(
-        "--preset",
-        choices=("llama31-8b-staged",),
-        default=None,
-        help=(
-            "Apply a recommended preset. llama31-8b-staged uses Llama 3.1 8B "
-            "Instruct, staged mode, full-checklist judge, and "
-            "programmatic rerank metadata."
-        ),
-    )
-    parser.add_argument(
-        "--model",
-        default=None,
-        help="Optional model identifier to include in each request spec.",
-    )
-    parser.add_argument(
-        "--branch-count",
-        type=int,
-        default=4,
-        help="Number of ToT branches to ask the model to explore. Use 3 or 4 for 8B models.",
-    )
-    parser.add_argument(
-        "--judge-mode",
-        choices=("simple",),
-        default="simple",
-        help="LLM judge style for staged mode.",
-    )
-    parser.add_argument(
-        "--rerank",
-        choices=("programmatic", "none"),
-        default="programmatic",
-        help="Whether to include programmatic rerank policy metadata.",
-    )
-    parser.add_argument(
-        "--max-items",
-        type=int,
-        default=None,
-        help="Optional cap for quick smoke tests.",
-    )
-    parser.add_argument(
-        "--start-at",
-        type=int,
-        default=0,
-        help="Zero-based offset in the input file.",
-    )
-    return parser.parse_args()
-
-
-def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
-    if args.preset == "llama31-8b-staged":
-        args.model = args.model or LLAMA31_8B_INSTRUCT
-        args.judge_mode = "simple"
-        args.rerank = "programmatic"
-    return args
-
-
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as fh:
@@ -172,11 +108,7 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def build_staged_spec(
-    entry: dict[str, Any],
-    branch_count: int,
-    judge_mode: str,
-) -> dict[str, Any]:
+def build_staged_spec(entry: dict[str, Any]) -> dict[str, Any]:
     generation_payload = {
         "query_id": entry.get("index"),
         "domain": entry.get("domain1"),
@@ -206,7 +138,7 @@ Input:
         },
         "expand_branches": {
             "system": TOT_SYSTEM_PROMPT,
-            "user_template": f"""Create exactly {branch_count} complete creative branches.
+            "user_template": f"""Create exactly {BRANCH_COUNT} complete creative branches.
 Each branch must be a complete solution path for the original task. Each branch
 must cover every item in constraint_map.must_include, and constraint_coverage
 must name each required item with a concrete plan for satisfying it. Do not split
@@ -236,6 +168,8 @@ development_path as the organizing logic for the candidate.
 Return exactly one JSON object with only these keys:
 branch_id, candidate_answer, self_check_notes.
 candidate_answer must be a complete, directly usable answer as one plain string.
+The JSON must be valid: escape line breaks inside candidate_answer as needed; do
+not emit an unterminated string or raw multiline JSON string.
 Do not use outline headings or act numbers as JSON keys; put all headings and
 bullets inside candidate_answer.
 
@@ -251,11 +185,14 @@ Branch plan:
         },
         "judge_branch": {
             "system": TOT_SYSTEM_PROMPT,
-            "judge_mode": judge_mode,
+            "judge_mode": JUDGE_MODE,
             "user_template": f"""Use a simple rubric judge for one candidate answer.
 Use the full WritingBench checklist below to score each criterion from 1 to 10.
-Also check constraint violations against the original query requirements. Keep
-the critique short and concrete.
+Also score branch_fidelity from 1 to 5: how faithfully the candidate executes
+its selected branch plan rather than falling back to a generic answer pattern.
+Check constraint violations against the original query requirements. Keep the
+critique short and concrete. Do not compute aggregate scores or list strengths;
+the program derives aggregate metrics from this JSON.
 
 Return exactly one JSON object matching this example shape:
 {json.dumps(JUDGE_OUTPUT_SCHEMA, ensure_ascii=False, indent=2)}
@@ -270,8 +207,18 @@ Candidate:
         "final_revision": {
             "system": TOT_SYSTEM_PROMPT,
             "user_template": f"""Revise only the selected best candidate into the final answer.
-Use the selected candidate and its judge feedback to fix weaknesses. Do not use,
-quote, blend, or borrow from any other candidate.
+Use the selected candidate, selected branch plan, selected judgment, and derived
+metrics to fix weaknesses. Prioritize constraint_violations, top_fix, each
+criterion's main_issue, and branch_fidelity.main_issue. Do not use, quote,
+blend, or borrow from any other candidate.
+
+The final_answer must contain a complete revised plot design, not just a title.
+It must be at least as detailed as the selected_candidate.candidate_answer.
+Do not shorten the selected candidate.
+Do not output only the title.
+Do not merely list suggestions.
+Apply the selected judgment feedback directly inside final_answer.
+revision_notes must describe edits actually made.
 
 Return exactly one JSON object matching this example shape:
 {json.dumps(FINAL_REVISION_SCHEMA, ensure_ascii=False, indent=2)}
@@ -286,72 +233,65 @@ Constraint map:
 Programmatic rerank result:
 {{rerank_result_json}}
 
-Selected branch plan:
-{{selected_branch_json}}
-
-Selected judge feedback:
-{{selected_judgment_json}}
-
-Selected candidate:
-{{selected_candidate_json}}
+Final revision input:
+{{final_revision_input_json}}
 """,
         },
     }
 
 
-def build_request(
-    entry: dict[str, Any],
-    branch_count: int,
-    model: Optional[str],
-    judge_mode: str,
-    rerank: str,
-) -> dict[str, Any]:
+def build_request(entry: dict[str, Any]) -> dict[str, Any]:
     common = {
         "index": entry.get("index"),
         "domain1": entry.get("domain1"),
         "domain2": entry.get("domain2"),
         "lang": entry.get("lang"),
         "query": entry.get("query"),
-        "branch_count": branch_count,
+        "branch_count": BRANCH_COUNT,
         "mode": "staged",
         "judge_checklist_mode": "full",
-        "model": model,
+        "model": MODEL,
     }
 
-    common["judge_mode"] = judge_mode
-    if rerank == "programmatic":
-        common["programmatic_rerank_policy"] = {
-            "primary_sort": "constraint_violations ascending",
-            "secondary_sort": "min_score descending",
-            "tertiary_sort": "mean_score descending",
-            "tie_breaker": "prefer the candidate with fewer fixable_issues; if still tied, prefer lower branch_id",
-            "selected_output_shape": {
-                "selected_branch_id": "...",
-                "ranking": [
-                    {
-                        "branch_id": "...",
-                        "constraint_violations": 0,
-                        "min_score": 0,
-                        "mean_score": 0.0,
-                    }
-                ],
-                "reason": "Computed from judge JSON, not by the LLM.",
-            },
-        }
-    common["stages"] = build_staged_spec(
-        entry,
-        branch_count,
-        judge_mode,
-    )
+    common["judge_mode"] = JUDGE_MODE
+    common["programmatic_rerank_policy"] = {
+        "primary_sort": "constraint_violation_count ascending",
+        "secondary_sort": "min_score descending",
+        "tertiary_sort": "mean_score descending",
+        "quaternary_sort": "branch_fidelity descending",
+        "tie_breaker": "prefer fewer derived fixable issues; if still tied, prefer lower branch_id",
+        "selected_output_shape": {
+            "selected_branch_id": "...",
+            "ranking": [
+                {
+                    "branch_id": "...",
+                    "constraint_violation_count": 0,
+                    "min_score": 0,
+                    "mean_score": 0.0,
+                    "branch_fidelity": 0,
+                    "fixable_issue_count": 0,
+                }
+            ],
+            "reason": "Computed from judge JSON, not by the LLM.",
+        },
+    }
+    common["stages"] = build_staged_spec(entry)
     return common
 
 
-def write_jsonl(records: list[dict[str, Any]], output: Path) -> None:
-    if str(output) == "-":
-        for record in records:
-            print(json.dumps(record, ensure_ascii=False))
-        return
+def output_path_for(index: Any) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return RUNS_DIR / f"{index}_request_{timestamp}.jsonl"
 
+
+def find_entry_by_index(entries: list[dict[str, Any]], target_index: int) -> dict[str, Any]:
+    for entry in entries:
+        if entry.get("index") == target_index:
+            return entry
+    raise ValueError(f"TARGET_INDEX={target_index} was not found in {INPUT_PATH}")
+
+
+def write_jsonl(records: list[dict[str, Any]], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as fh:
         for record in records:
@@ -359,30 +299,16 @@ def write_jsonl(records: list[dict[str, Any]], output: Path) -> None:
 
 
 def main() -> None:
-    args = parse_args()
-    args = apply_preset(args)
-    if args.branch_count < 1:
-        raise ValueError("--branch-count must be >= 1")
+    if BRANCH_COUNT < 1:
+        raise ValueError("BRANCH_COUNT must be >= 1")
 
-    entries = load_jsonl(args.input)
-    selected = entries[args.start_at:]
-    if args.max_items is not None:
-        selected = selected[:args.max_items]
+    entries = load_jsonl(INPUT_PATH)
+    selected_entry = find_entry_by_index(entries, TARGET_INDEX)
+    request = build_request(selected_entry)
+    output = output_path_for(selected_entry.get("index"))
+    write_jsonl([request], output)
 
-    requests = [
-        build_request(
-            entry=entry,
-            branch_count=args.branch_count,
-            model=args.model,
-            judge_mode=args.judge_mode,
-            rerank=args.rerank,
-        )
-        for entry in selected
-    ]
-    write_jsonl(requests, args.output)
-
-    if str(args.output) != "-":
-        print(f"Wrote {len(requests)} ToT staged request(s) to: {args.output}")
+    print(f"Wrote ToT staged request for index={TARGET_INDEX} to: {output}")
 
 
 if __name__ == "__main__":

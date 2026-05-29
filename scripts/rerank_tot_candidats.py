@@ -1,34 +1,24 @@
 """Programmatically rerank Tree-of-Thought candidate judgments.
 
-Expected inputs are JSONL records from the staged judge step. The script accepts
-either one judgment per line or bundle records with a ``judgments`` list.
+Edit INPUT_PATH below to rerank a specific JSONL file. Leave it as None to use
+the newest ``*_output_*.jsonl`` file under data/runs/. The script accepts either
+one judgment per line or bundle records with a ``judgments`` list.
 """
 
 
-import argparse
 import json
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Rerank ToT candidates using simple deterministic rules."
-    )
-    parser.add_argument(
-        "--input",
-        type=Path,
-        required=True,
-        help="JSONL file containing judge outputs.",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help="Output JSONL path. Omit or use '-' to print to stdout.",
-    )
-    return parser.parse_args()
+ROOT = Path(__file__).resolve().parent.parent
+RUNS_DIR = ROOT / "data" / "runs"
+
+# Set this to a concrete Path to rerank a specific JSONL file. Leave it as None
+# to rerank the newest run_tot_ollama.py output file.
+INPUT_PATH: Optional[Path] = None
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -54,59 +44,73 @@ def branch_sort_value(branch_id: Any) -> str:
     return str(branch_id or "")
 
 
-def normalize_judgment(record: dict[str, Any]) -> dict[str, Any]:
-    scores = record.get("scores_by_criterion") or []
-    derived_scores = [
-        safe_float(item.get("score_1_to_10"))
-        for item in scores
-        if isinstance(item, dict)
-    ]
-    min_score = record.get("min_score")
-    mean_score = record.get("mean_score")
+def derive_judgment_metrics(judgment: dict[str, Any]) -> dict[str, Any]:
+    scores = []
+    for item in judgment.get("scores_by_criterion", []):
+        if not isinstance(item, dict):
+            scores.append(0.0)
+            continue
+        scores.append(safe_float(item.get("score_1_to_10")))
 
-    if min_score is None and derived_scores:
-        min_score = min(derived_scores)
-    if mean_score is None and derived_scores:
-        mean_score = sum(derived_scores) / len(derived_scores)
+    branch_fidelity = judgment.get("branch_fidelity", {})
+    if isinstance(branch_fidelity, dict):
+        branch_fidelity_score = safe_float(branch_fidelity.get("score_1_to_5"))
+    else:
+        branch_fidelity_score = safe_float(branch_fidelity)
+
+    issues = [
+        item.get("main_issue", "")
+        for item in judgment.get("scores_by_criterion", [])
+        if isinstance(item, dict)
+        and item.get("main_issue")
+        and item.get("main_issue", "").lower() not in {"none", "n/a"}
+    ]
+
+    if isinstance(branch_fidelity, dict):
+        bf_issue = branch_fidelity.get("main_issue")
+        if bf_issue and bf_issue.lower() not in {"none", "n/a"}:
+            issues.append(bf_issue)
 
     return {
-        "branch_id": record.get("branch_id"),
-        "constraint_violations": count_items(record.get("constraint_violations")),
-        "min_score": safe_float(min_score),
-        "mean_score": safe_float(mean_score),
-        "fixable_issue_count": count_items(record.get("fixable_issues")),
-        "raw_judgment": record,
+        "mean_score": sum(scores) / len(scores) if scores else 0.0,
+        "min_score": min(scores) if scores else 0.0,
+        "branch_fidelity": branch_fidelity_score,
+        "constraint_violation_count": count_items(
+            judgment.get("constraint_violations", [])
+        ),
+        "fixable_issue_count": len(issues),
+        "fixable_issues": issues,
     }
 
 
-def ranking_key(item: dict[str, Any]) -> tuple[float, float, float, int, str]:
+def ranking_key(item: dict[str, Any]) -> tuple[int, float, float, float, int, str]:
+    metrics = derive_judgment_metrics(item)
     return (
-        safe_float(item.get("constraint_violations")),
-        -safe_float(item.get("min_score")),
-        -safe_float(item.get("mean_score")),
-        int(item.get("fixable_issue_count", 0)),
+        metrics["constraint_violation_count"],
+        -metrics["min_score"],
+        -metrics["mean_score"],
+        -metrics["branch_fidelity"],
+        metrics["fixable_issue_count"],
         branch_sort_value(item.get("branch_id")),
     )
 
 
 def rerank(judgments: list[dict[str, Any]]) -> dict[str, Any]:
-    ranking = sorted((normalize_judgment(j) for j in judgments), key=ranking_key)
+    ranking = sorted(judgments, key=ranking_key)
     selected = ranking[0] if ranking else None
     return {
         "selected_branch_id": None if selected is None else selected.get("branch_id"),
         "ranking": [
             {
                 "branch_id": item.get("branch_id"),
-                "constraint_violations": item.get("constraint_violations"),
-                "min_score": item.get("min_score"),
-                "mean_score": item.get("mean_score"),
-                "fixable_issue_count": item.get("fixable_issue_count"),
+                **derive_judgment_metrics(item),
             }
             for item in ranking
         ],
         "reason": (
             "Sorted by constraint_violations asc, min_score desc, "
-            "mean_score desc, fixable_issue_count asc, branch_id asc."
+            "mean_score desc, branch_fidelity desc, fixable_issue_count asc, "
+            "branch_id asc. Metrics are derived from judge JSON."
         ),
     }
 
@@ -153,12 +157,28 @@ def build_outputs(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return bundled
 
 
-def write_outputs(outputs: list[dict[str, Any]], output: Optional[Path]) -> None:
-    if output is None or str(output) == "-":
-        for item in outputs:
-            print(json.dumps(item, ensure_ascii=False))
-        return
+def latest_output_path() -> Path:
+    output_paths = sorted(
+        RUNS_DIR.glob("*_output_*.jsonl"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not output_paths:
+        raise FileNotFoundError(
+            f"No *_output_*.jsonl files found in {RUNS_DIR}. Run run_tot_ollama.py first."
+        )
+    return output_paths[0]
 
+
+def output_path_for(outputs: list[dict[str, Any]]) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if len(outputs) == 1:
+        index = outputs[0].get("index", "unknown")
+        return RUNS_DIR / f"{index}_rerank_{timestamp}.jsonl"
+    return RUNS_DIR / f"batch_rerank_{timestamp}.jsonl"
+
+
+def write_outputs(outputs: list[dict[str, Any]], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as fh:
         for item in outputs:
@@ -166,10 +186,14 @@ def write_outputs(outputs: list[dict[str, Any]], output: Optional[Path]) -> None
 
 
 def main() -> None:
-    args = parse_args()
-    records = iter_jsonl(args.input)
+    input_path = INPUT_PATH or latest_output_path()
+    records = iter_jsonl(input_path)
     outputs = build_outputs(records)
-    write_outputs(outputs, args.output)
+    output_path = output_path_for(outputs)
+    write_outputs(outputs, output_path)
+
+    print(f"Read judge output(s) from: {input_path}")
+    print(f"Wrote {len(outputs)} rerank result(s) to: {output_path}")
 
 
 if __name__ == "__main__":

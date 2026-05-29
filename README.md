@@ -1,108 +1,165 @@
 # Creative RAG Pipeline
 
-A training-free Creative Writing Enhancement Pipeline that combines multi-branch generation with Retrieval-Augmented Generation (RAG). The system retrieves stylistically relevant poetry lines from a large public-domain corpus to augment a language model's creative writing outputs, then evaluates results against structured criteria from the WritingBench benchmark.
+這個專案是一個 training-free 的創意寫作增強流程。現在的主軸是 staged Tree-of-Thought：先把使用者題目整理成約束，再產生多個分支方案，分別寫候選答案，用 WritingBench checklist 評分，最後用程式 rerank 選出最佳候選並做 final revision。
 
-## Quickstart
+
+## 快速開始
 
 ```bash
-# 1. Download raw data (WritingBench ~14 MB + Gutenberg Poetry ~52 MB compressed)
+# 1. 下載原始資料：WritingBench + Gutenberg Poetry Corpus
 bash scripts/download_data.sh
 
-# 2. Filter WritingBench to Literature & Arts / English test set
+# 2. 篩出 Literature & Arts / English 測試集
 python scripts/sample_writingbench.py
 
-# 3. Verify the Gutenberg Poetry Corpus download
+# 3. 檢查 Gutenberg Poetry Corpus 是否可讀
 python scripts/inspect_gutenberg.py
 ```
 
-Raw files land in `data/raw/` (gitignored). The processed test set is committed at `data/test_set/test_set_lit_arts_en.jsonl`.
+已處理好的測試集在 `data/test_set/test_set_lit_arts_en.jsonl`。
 
-## Data Overview
+## 資料概覽
 
-| Dataset | Role | Size | Entries |
-|---|---|---|---|
-| WritingBench — Lit & Arts EN | Test query set | ~1.4 MB | ~96 queries |
-| Gutenberg Poetry Corpus | RAG knowledge base | ~52 MB (.gz) | ~3 M lines |
+| Dataset | 用途 | 大小 | 筆數 |
+|---|---|---:|---:|
+| WritingBench - Lit & Arts EN | 測試題目與 checklist | 約 1.4 MB | 約 96 題 |
+| Gutenberg Poetry Corpus | 未來 RAG knowledge base | 約 52 MB 壓縮檔 | 約 300 萬行 |
 
-## Current ToT Pipeline
+## ToT 完整流程
 
-The current Tree-of-Thought flow is staged and local-model oriented. It starts
-from the processed WritingBench test set and writes all intermediate artifacts as
-JSONL under `data/runs/`. The WritingBench checklist is included only in the
-`judge_branch` prompt. Constraint mapping, branch expansion, drafting, and final
-revision do not receive checklist data.
+目前流程以單題 staged request 為單位。`build_tot_requests.py` 只產生 request spec，不會 call model；真正 call Ollama API 的是 `run_tot_ollama.py`。
 
-### 1. Build ToT Request Specs
+```text
+WritingBench 題目
+      ↓
+build_tot_requests.py
+      ↓
+request JSONL
+      ↓
+run_tot_ollama.py
+      ↓
+constraint_map
+      ↓
+expand_branches
+      ↓
+K 個 branches
+      ↓
+draft_branch + judge_branch
+      ↓
+K 份 candidate + judgment
+      ↓
+programmatic rerank
+      ↓
+final_revision
+      ↓
+output JSONL
+```
+
+
+
+### API 呼叫次數
+
+令 `K = BRANCH_COUNT`。在沒有 retry 的情況下，單題會 call Ollama API：
+
+```text
+1 次 constraint_map
++ 1 次 expand_branches
++ K 次 draft_branch
++ K 次 judge_branch
++ 1 次 final_revision
+= 2K + 3 次 API call
+```
+
+例如 `BRANCH_COUNT = 3` 時，基礎呼叫數是 `2 * 3 + 3 = 9` 次。
+
+額外呼叫來源：
+
+- draft candidate validation 失敗時，每個 branch 最多額外 `CANDIDATE_RETRIES` 次 draft call。
+- final revision validation 失敗時，最多額外 `FINAL_REVISION_RETRIES` 次 final call。
+- programmatic rerank 不 call model，只用 judge JSON 做 deterministic sorting。
+
+## 產生 Request
 
 Script: `scripts/build_tot_requests.py`
 
-Input:
+改設定可改檔案前面的全域參數：
 
-- `data/test_set/test_set_lit_arts_en.jsonl`
+```python
+MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+BRANCH_COUNT = 3
+TARGET_INDEX = 180 
+```
+TARGET_INDEX指 `data/test_set/test_set_lit_arts_en.jsonl` 裡的哪個題目
 
-Output:
+固定 input：
 
-- a staged request-spec JSONL file, for example `data/runs/tot_smoke_requests.jsonl`
-
-Typical command:
-
-```bash
-python scripts/build_tot_requests.py \
-  --preset llama31-8b-staged \
-  --output data/runs/llama31_8b_staged_tot_requests_lit_arts_en.jsonl
+```text
+data/test_set/test_set_lit_arts_en.jsonl
 ```
 
-Useful knobs:
+執行：
 
-- `--max-items N`: small smoke run
-- `--start-at N`: resume from an offset
-- `--branch-count N`: number of branches
+```bash
+python scripts/build_tot_requests.py
+```
 
-### 2. Run Staged ToT With Ollama
+輸出會放在 `data/runs/`，檔名格式：
+
+```text
+{index}_request_{timestamp}.jsonl
+```
+
+例如：
+
+```text
+data/runs/180_request_20260529_235516.jsonl
+```
+
+## 執行 ToT
 
 Script: `scripts/run_tot_ollama.py`
 
+先準備 Ollama model：
+
 ```bash
 ollama pull llama3.1:8b
-ollama pull qwen2.5:14b-instruct
+ollama pull qwen2.5:14b-instruct-q4_K_M
 ollama serve
-
-python scripts/run_tot_ollama.py \
-  --input data/runs/llama31_8b_staged_tot_requests_lit_arts_en.jsonl \
-  --output data/runs/llama31_8b_staged_tot_outputs_lit_arts_en.jsonl
 ```
 
-Model split:
+執行：
 
-- generation model: `llama3.1:8b` for constraint mapping, branch expansion, drafting, and final revision
-- judge model: `qwen2.5:14b-instruct` for `judge_branch`
+```bash
+python scripts/run_tot_ollama.py
+```
 
-Runtime order for each query:
+預設會自動讀取 `data/runs/` 裡最新的 `*_request_*.jsonl`。如果要指定特定 request 檔，就改 `run_tot_ollama.py` 前面的：
 
-1. `constraint_map`: query-only constraint extraction.
-2. `expand_branches`: generate K narrative-architecture branches.
-3. `draft_branch`: generate one complete candidate answer per branch.
-4. branch-level RAG: planned, currently skipped.
-5. `judge_branch`: use the full WritingBench checklist to score candidates.
-6. programmatic rerank: sort by constraint violations, min score, then mean
-   score, with deterministic tie-breakers.
-7. `final_revision`: revise only the selected best candidate using its own judge
-   feedback. Other candidates are not provided to this stage.
+```python
+REQUEST_PATH = None
+```
 
-Each output record contains:
+輸出會放在 `data/runs/`，檔名格式：
 
-- `constraint_map`: query-only constraints
-- `branch_expansion`: branch plans
-- `candidates`: generated branch answers
-- `judgments`: LLM judge scores and issues
-- `candidate_retry_notes`: local validation/retry notes
-- `rerank_result`: selected branch and ranking
-- `selected_branch`, `selected_candidate`, `selected_judgment`: final inputs
-- `final`: final answer plus revision notes/audit
+```text
+{index}_output_{timestamp}.jsonl
+```
 
-### Stage Prompts
+runner 目前的 model 分工：
 
-All stages use this system prompt:
+- `GENERATION_MODEL = "llama3.1:8b"`：用於 constraint mapping、branch expansion、candidate drafting、final revision。
+- `JUDGE_MODEL = "qwen2.5:14b-instruct-q4_K_M"`：用於 `judge_branch`。
+
+runner 也會做 local validation：
+
+- candidate 太短或 JSON shape 不對，會重試 draft。
+- final answer 如果短於 selected candidate 的 70%，或看起來只是標題/摘要，會重試 final revision。
+- retry notes 會寫入 output，方便追蹤。
+
+
+## Prompt 與輸出細節
+
+所有 stage 共用 system prompt：
 
 ```text
 You are a creative-writing Tree-of-Thought controller.
@@ -110,13 +167,13 @@ Use visible, concise deliberation artifacts only: constraint maps, branch plans,
 rubric scores, and revision notes. Do not reveal hidden chain-of-thought.
 ```
 
-`constraint_map` user prompt:
+### 1. constraint_map
 
-```text
-Extract a concise constraint map from the user's creative-writing query only.
-Separate explicit requirements from avoidances, style, structure, ambiguities,
-and likely failure modes. Return exactly one JSON object matching this example
-shape:
+目的：只根據原始題目抽取約束，不看 WritingBench checklist。
+
+輸出 schema：
+
+```json
 {
   "task_type": "...",
   "must_include": ["..."],
@@ -126,24 +183,15 @@ shape:
   "open_questions_or_ambiguities": ["..."],
   "likely_failure_modes": ["..."]
 }
-
-Input:
-{generation_payload_json}
 ```
 
-`expand_branches` user prompt template:
+### 2. expand_branches
 
-```text
-Create exactly {branch_count} complete creative branches.
-Each branch must be a complete solution path for the original task. Each branch
-must cover every item in constraint_map.must_include, and constraint_coverage
-must name each required item with a concrete plan for satisfying it. Do not split
-required elements across separate branches: every branch must handle the whole
-task. The branches must be genuinely different narrative architectures, not
-minor variations or different evaluation dimensions. Do not score branches. Keep
-each branch compact but complete enough to guide drafting.
+目的：產生 `K = BRANCH_COUNT` 個完整且彼此不同的創作路線。每個 branch 都必須能獨立完成整題，不可以把需求拆給不同 branch 分工。
 
-Return exactly one JSON object matching this example shape:
+輸出 schema：
+
+```json
 {
   "branches": [
     {
@@ -163,49 +211,38 @@ Return exactly one JSON object matching this example shape:
     }
   ]
 }
-
-Original input:
-{generation_payload_json}
-
-Constraint map:
-{constraint_map_json}
 ```
 
-`draft_branch` user prompt template:
+### 3. draft_branch
 
-```text
-Write one candidate answer for the selected branch.
-Respect the original user query and the constraint map. Visibly execute the
-selected branch's narrative_architecture. Do not fall back to a generic outline
-or generic answer pattern. Use the branch's distinctive_material and follow its
-development_path as the organizing logic for the candidate.
+目的：針對單一 branch 寫出完整候選答案。候選答案要放在單一字串 `candidate_answer` 裡，不把章節或條列拆成 JSON key。
 
-Return exactly one JSON object with only these keys:
-branch_id, candidate_answer, self_check_notes.
-candidate_answer must be a complete, directly usable answer as one plain string.
-Do not use outline headings or act numbers as JSON keys; put all headings and
-bullets inside candidate_answer.
+輸出 schema：
 
-Original input:
-{generation_payload_json}
-
-Constraint map:
-{constraint_map_json}
-
-Branch plan:
-{branch_plan_json}
+```json
+{
+  "branch_id": "A",
+  "candidate_answer": "完整、可直接交給使用者的答案...",
+  "self_check_notes": ["..."]
+}
 ```
 
-`judge_branch` user prompt template. This is the only stage that receives the
-full WritingBench checklist:
+runner 會檢查：
 
-```text
-Use a simple rubric judge for one candidate answer.
-Use the full WritingBench checklist below to score each criterion from 1 to 10.
-Also check constraint violations against the original query requirements. Keep
-the critique short and concrete.
+- top-level keys 只能是 `branch_id`、`candidate_answer`、`self_check_notes`。
+- `candidate_answer` 必須是字串。
+- `candidate_answer` 長度至少是 `MIN_CANDIDATE_CHARS`。
+- 如果不合格，最多重試 `CANDIDATE_RETRIES` 次。
 
-Return exactly one JSON object matching this example shape:
+### 4. judge_branch
+
+目的：用完整 WritingBench checklist 評估每個 candidate。這是唯一會收到 checklist 的 stage。
+
+模型只負責判斷，不負責計算 aggregate metrics。
+
+輸出 schema：
+
+```json
 {
   "branch_id": "A",
   "scores_by_criterion": [
@@ -216,30 +253,83 @@ Return exactly one JSON object matching this example shape:
       "main_issue": "..."
     }
   ],
-  "mean_score": 0.0,
-  "min_score": 0,
-  "constraint_violations": ["..."],
-  "strengths": ["..."],
-  "fixable_issues": ["..."]
+  "branch_fidelity": {
+    "score_1_to_5": 0,
+    "evidence": "...",
+    "main_issue": "..."
+  },
+  "constraint_violations": [],
+  "top_fix": "..."
 }
-
-Original input:
-{judge_payload_json_with_full_checklist}
-
-Candidate:
-{candidate_json}
 ```
 
-`final_revision` user prompt template:
+### 5. programmatic rerank
 
-```text
-Revise only the selected best candidate into the final answer.
-Use the selected candidate and its judge feedback to fix weaknesses. Do not use,
-quote, blend, or borrow from any other candidate.
+`rerank_tot_candidats.py` 會從 judge JSON 推導 metrics：
 
-Return exactly one JSON object matching this example shape:
+```python
+derived_metrics = {
+    "mean_score": ...,
+    "min_score": ...,
+    "branch_fidelity": ...,
+    "constraint_violation_count": ...,
+    "fixable_issue_count": ...,
+    "fixable_issues": [...],
+}
+```
+
+排序規則：
+
+1. `constraint_violation_count` 越少越好。
+2. `min_score` 越高越好。
+3. `mean_score` 越高越好。
+4. `branch_fidelity` 越高越好。
+5. `fixable_issue_count` 越少越好。
+6. 最後用 `branch_id` 做 deterministic tie-breaker。
+
+### 6. final_revision
+
+目的：只修 selected candidate，不混用其他 candidate。final revision 的 input 是 compact payload：
+
+```json
 {
-  "final_answer": "...",
+  "selected_candidate": {
+    "branch_id": "A",
+    "candidate_answer": "...",
+    "self_check_notes": ["..."]
+  },
+  "selected_branch_plan": {
+    "id": "A",
+    "name": "..."
+  },
+  "selected_judgment": {
+    "scores_by_criterion": ["..."],
+    "branch_fidelity": {"...": "..."},
+    "constraint_violations": [],
+    "top_fix": "..."
+  },
+  "derived_metrics": {
+    "mean_score": 0.0,
+    "min_score": 0.0,
+    "branch_fidelity": 0.0
+  }
+}
+```
+
+final prompt 的硬性要求：
+
+- `final_answer` 必須是完整 revised answer，不可以只是標題。
+- `final_answer` 必須至少和 `selected_candidate.candidate_answer` 一樣詳細。
+- 不可以縮短 selected candidate。
+- 不可以只是列修改建議。
+- 必須把 `constraint_violations`、`top_fix`、每個 criterion 的 `main_issue`、`branch_fidelity.main_issue` 直接修進 `final_answer`。
+- `revision_notes` 必須描述實際做了哪些改動。
+
+輸出 schema：
+
+```json
+{
+  "final_answer": "完整修訂後答案...",
   "revision_notes": ["..."],
   "rubric_audit": [
     {
@@ -250,62 +340,46 @@ Return exactly one JSON object matching this example shape:
     }
   ]
 }
-The final_answer must be directly usable by the original user.
-
-Original input:
-{generation_payload_json}
-
-Constraint map:
-{constraint_map_json}
-
-Programmatic rerank result:
-{rerank_result_json}
-
-Selected branch plan:
-{selected_branch_json}
-
-Selected judge feedback:
-{selected_judgment_json}
-
-Selected candidate:
-{selected_candidate_json}
 ```
 
-### 3. Rerank Candidates
+runner 會檢查 final：
 
-Script: `scripts/rerank_tot_candidats.py`
+- `final_answer` 必須是非空字串。
+- `final_answer` 長度必須至少是 selected candidate 的 `MIN_FINAL_CANDIDATE_RATIO`，目前是 70%。
+- `final_answer <= 80 chars` 會被視為 title/summary，不合格。
+- `revision_notes` 必須存在且非空。
+- 如果不合格，最多重試 `FINAL_REVISION_RETRIES` 次。
 
-This is also imported directly by `run_tot_ollama.py`, so normally you do not
-need to run it separately. It is useful when you already have judge outputs and
-want to rerank them offline.
+## Output Record 欄位
 
-```bash
-python scripts/rerank_tot_candidats.py \
-  --input data/runs/judgments.jsonl \
-  --output data/runs/rerank_results.jsonl
-```
+`run_tot_ollama.py` 每題會輸出一筆 JSON object，主要欄位如下：
 
-Ranking rule:
+| 欄位 | 說明 |
+|---|---|
+| `constraint_map` | 題目約束整理 |
+| `branch_expansion` | K 個 branch plans |
+| `candidates` | 每個 branch 的候選答案 |
+| `judgments` | 每個 candidate 的 judge JSON |
+| `candidate_retry_notes` | candidate validation 與 retry 紀錄 |
+| `rerank_result` | deterministic ranking 與 selected branch |
+| `selected_branch` | 被選中的 branch plan |
+| `selected_candidate` | 被選中的 candidate answer |
+| `selected_judgment` | 被選中的完整 judge JSON |
+| `selected_derived_metrics` | 程式推導出的 metrics |
+| `final_revision_input` | 傳給 final revision 的 compact payload |
+| `final_retry_notes` | final validation 與 retry 紀錄 |
+| `final` | final answer、revision notes、rubric audit |
 
-1. fewer `constraint_violations`
-2. higher `min_score`
-3. higher `mean_score`
-4. fewer `fixable_issues` as a tie-breaker
-5. lower/smaller `branch_id` as a final tie-breaker
+## 修改入口
 
-## Where To Start Changing Things
+| 想改的東西 | 位置 |
+|---|---|
+| 要跑哪一題、branch 數、request model id | `scripts/build_tot_requests.py` 頂部全域參數 |
+| Ollama model、temperature、timeout、retry 次數 | `scripts/run_tot_ollama.py` 頂部全域參數 |
+| 測試題目資料 | `data/test_set/test_set_lit_arts_en.jsonl` |
+| 原始資料說明 | `docs/DATA_README.md` |
 
-- Change staged prompts or JSON output examples in `scripts/build_tot_requests.py`.
-- Change local execution, retries, validation, Ollama model mapping, or output
-  shape in `scripts/run_tot_ollama.py`.
-- Change candidate selection logic in `scripts/rerank_tot_candidats.py`.
-- Add branch-level RAG between drafting and judging when the CA-KB retrieval
-  interface is ready.
-- Change the test queries in `data/test_set/test_set_lit_arts_en.jsonl`.
-- Existing example runs live in `data/runs/`, including index-180 and smoke
-  request/output files.
-
-## Citations
+## 引用
 
 ```bibtex
 @article{wu2025writingbench,
@@ -317,7 +391,7 @@ Ranking rule:
 }
 ```
 
-```
+```text
 Allison Parrish (2018). gutenberg-poetry-corpus.
 https://github.com/aparrish/gutenberg-poetry-corpus
 ```
