@@ -25,9 +25,11 @@ python scripts/inspect_gutenberg.py
 | WritingBench - Lit & Arts EN | 測試題目與 checklist | 約 1.4 MB | 約 96 題 |
 | Gutenberg Poetry Corpus | 未來 RAG knowledge base | 約 52 MB 壓縮檔 | 約 300 萬行 |
 
-## ToT 完整流程
+## ToT + RAG 完整流程
 
-目前流程以單題 staged request 為單位。`build_tot_requests.py` 只產生 request spec，不會 call model；真正 call Ollama API 的是 `run_tot_ollama.py`。
+目前流程以單題 staged request 為單位。`build_tot_requests.py` 只產生 request spec，不會 call model；真正執行模型的是 runner。`run_tot_ollama.py` 和 `run_tot_hf.py` 只是 model backend 不同，核心 stage 相同。
+
+RAG 負責的主軸是：先由 `expand_branches` 產生不同創作路線，再對每個 branch 套用不同 RAG variant，形成 reranker 可排序的 candidate pool。
 
 ```text
 WritingBench 題目
@@ -36,16 +38,26 @@ build_tot_requests.py
       ↓
 request JSONL
       ↓
-run_tot_ollama.py
-      ↓
 constraint_map
       ↓
 expand_branches
       ↓
 K 個 branches
       ↓
-draft_branch + judge_branch
+每個 branch 套用 RAG variants
       ↓
+draft_branch
+      ↓
+judge_branch + association_use
+      ↓
+candidate pool JSONL
+      ↓
+reranker
+```
+
+完整 ToT runner 仍可做原本的 deterministic rerank 與 final revision：
+
+```text
 K 份 candidate + judgment
       ↓
 programmatic rerank
@@ -57,9 +69,9 @@ output JSONL
 
 
 
-### API 呼叫次數
+### Model 呼叫次數
 
-令 `K = BRANCH_COUNT`。在沒有 retry 的情況下，單題會 call Ollama API：
+令 `K = BRANCH_COUNT`。在沒有 retry 的情況下，單題完整 ToT runner 會呼叫模型：
 
 ```text
 1 次 constraint_map
@@ -71,6 +83,18 @@ output JSONL
 ```
 
 例如 `BRANCH_COUNT = 3` 時，基礎呼叫數是 `2 * 3 + 3 = 9` 次。
+
+若使用 reranker candidate pool builder，令 `V = RAG variant 數量`，則在沒有 retry 的情況下會呼叫：
+
+```text
+1 次 constraint_map
++ 1 次 expand_branches
++ V × K 次 draft_branch
++ V × K 次 judge_branch
+= 2 + 2VK 次 model call
+```
+
+例如預設 `V = 4`、`K = 3` 時，會產生 `4 × 3 = 12` 個 candidates，基礎模型呼叫數是 `2 + 2 * 4 * 3 = 26` 次。
 
 額外呼叫來源：
 
@@ -115,42 +139,40 @@ python scripts/build_tot_requests.py
 data/runs/180_request_20260529_235516.jsonl
 ```
 
-## 執行 ToT
+## Model Backend 與執行入口
 
-Script: `scripts/run_tot_ollama.py`
+兩個 ToT runner 的差異只在模型載入方式，stage 邏輯相同：
 
-先準備 Ollama model：
+| Runner | 用途 | Model backend |
+|---|---|---|
+| `scripts/run_tot_ollama.py` | 原本完整 ToT：draft、judge、programmatic rerank、final revision | Ollama |
+| `scripts/run_tot_hf.py` | HuggingFace 版本完整 ToT：draft、judge、programmatic rerank、final revision | Transformers |
+| `scripts/build_reranker_pool_hf.py` | RAG 組交接給 reranker 的 candidate pool builder | Transformers |
+
+如果要跑原本 Ollama backend：
 
 ```bash
 ollama pull llama3.1:8b
 ollama pull qwen2.5:14b-instruct-q4_K_M
 ollama serve
-```
-
-執行：
-
-```bash
 python scripts/run_tot_ollama.py
 ```
 
-預設會自動讀取 `data/runs/` 裡最新的 `*_request_*.jsonl`。如果要指定特定 request 檔，就改 `run_tot_ollama.py` 前面的：
+如果要跑 HuggingFace backend：
 
-```python
-REQUEST_PATH = None
+```bash
+python scripts/run_tot_hf.py
 ```
 
-輸出會放在 `data/runs/`，檔名格式：
+如果要產生 reranker candidate pool：
 
-```text
-{index}_output_{timestamp}.jsonl
+```bash
+python scripts/build_reranker_pool_hf.py
 ```
 
-runner 目前的 model 分工：
+這些 runner 預設都會讀取 `data/runs/` 裡最新的 `*_request_*.jsonl`。輸出會放在 `data/runs/`。
 
-- `GENERATION_MODEL = "llama3.1:8b"`：用於 constraint mapping、branch expansion、candidate drafting、final revision。
-- `JUDGE_MODEL = "qwen2.5:14b-instruct-q4_K_M"`：用於 `judge_branch`。
-
-runner 也會做 local validation：
+runner 會做 local validation：
 
 - candidate 太短或 JSON shape 不對，會重試 draft。
 - final answer 如果短於 selected candidate 的 70%，或看起來只是標題/摘要，會重試 final revision。
@@ -372,12 +394,116 @@ runner 會檢查 final：
 | `final_retry_notes` | final validation 與 retry 紀錄 |
 | `final` | final answer、revision notes、rubric audit |
 
+## Creative Association RAG 與 Reranker Handoff
+
+RAG 部分接在 `expand_branches` 之後、`draft_branch` 之前。也就是先產生不同 branch，再對每個 branch 套用不同 retrieval variant。主要交接入口：
+
+```bash
+python scripts/build_reranker_pool_hf.py
+```
+
+這個 script 是交接給 reranker 組員用的 candidate pool builder。它不要求下游手動拆開跑不同 RAG mode，而是一次產生可排序的候選集合：
+
+```text
+constraint_map
+→ expand_branches
+→ variants × branches retrieval
+→ variants × branches drafting
+→ judge_branch + association_use
+→ derived_metrics
+→ reranker candidate pool JSONL
+```
+
+這py檔停在意 rerank 前，不做 programmatic rerank，也不做 final_revision。下游 reranker 可以直接讀 candidate pool，設計自己的排序策略。
+
+### Branch 的意義
+
+`expand_branches` 產生的 branch 不是 RAG variant，而是同一題下的不同創作路線。若 `BRANCH_COUNT = 3`，一題會先展開三種互相不同但都能完整回答原題的寫法。
+
+以目前測試的 `index=180` 為例，題目是 post-apocalyptic sci-fi novel outline，主角是 introverted 但有責任感的 delivery courier。這次產生的三個 branch 可以理解為：
+
+| Branch | 名稱 | 意義 |
+|---|---|---|
+| A | Rugged Survival | 線性、穩健的末日求生版本，強調 courier 如何靠城市路線經驗求生，逐步遇到倖存者並發現陰謀。 |
+| B | Survival Odyssey | episodic 任務旅程版本，用一次次 delivery 串起老人、孤兒、物資、線索與城市區域。 |
+| C | Rebirth of Humanity | 非線性、主題深化版本，用多視角與時間跳接呈現人性重生、城市記憶與災難真相。 |
+
+簡單說：
+
+```text
+A = 穩健線性求生版
+B = 配送任務 episodic 旅程版
+C = 非線性人性重生 / 主題深化版
+```
+
+### RAG Variants 的意義
+
+RAG variants 是套在每個 branch 上的 retrieval 條件。預設會一次跑四種：
+
+| Variant | 意義 |
+|---|---|
+| `none` | 不使用 RAG，作為 no-RAG baseline。 |
+| `random_association` | 從 creative KB 隨機抽知識，測試隨機靈感是否真的有幫助。 |
+| `near_relevance` | 找和題目最直接相關的知識，作為普通相關性 RAG baseline。 |
+| `creative_association` | 找可隱喻化、可轉成情節、角色、意象或世界觀機制的中距離知識，這是本專案 RAG 的主要方法。 |
+
+因此 `index=180` 在預設設定下會產生：
+
+```text
+4 variants × 3 branches = 12 candidates
+```
+
+輸出檔名格式：
+
+```text
+data/runs/{index}_reranker_pool_hf_{timestamp}.jsonl
+```
+
+每一行是一個 reranker 可排序的 candidate，主要欄位：
+
+```json
+{
+  "pool_variant": "creative_association",
+  "branch_id": "C",
+  "branch_plan": {},
+  "association_packet": {},
+  "candidate": {},
+  "judgment": {},
+  "derived_metrics": {},
+  "association_use": {}
+}
+```
+
+其中 `judgment` 仍包含 WritingBench checklist scores、`branch_fidelity`、`constraint_violations` 等 task-validity 評估；`association_use` 則額外評估 retrieved knowledge 是否自然轉換進文本：
+
+```json
+{
+  "association_use": {
+    "score_1_to_5": 4,
+    "used_item_ids": ["geo_seed_bank_svalbard"],
+    "evidence": "...",
+    "main_issue": "..."
+  }
+}
+```
+
+目前 `association_use` 不直接參與原本 deterministic rerank，而是保留給 reranker 組員決定是否加入排序，例如 task-validity first、再加入 novelty / association quality。
+
+如果只想產生部分 variants，可以用環境變數：
+
+```bash
+RAG_VARIANTS=none,creative_association python scripts/build_reranker_pool_hf.py
+```
+
 ## 修改入口
 
 | 想改的東西 | 位置 |
 |---|---|
 | 要跑哪一題、branch 數、request model id | `scripts/build_tot_requests.py` 頂部全域參數 |
-| Ollama model、temperature、timeout、retry 次數 | `scripts/run_tot_ollama.py` 頂部全域參數 |
+| Ollama backend 設定 | `scripts/run_tot_ollama.py` 頂部全域參數 |
+| HuggingFace backend 設定 | `scripts/run_tot_hf.py` 頂部全域參數 |
+| Reranker candidate pool variants | `scripts/build_reranker_pool_hf.py` 或 `RAG_VARIANTS` 環境變數 |
+| Creative Association KB | `data/creative_kb/associations.jsonl` |
 | 測試題目資料 | `data/test_set/test_set_lit_arts_en.jsonl` |
 | 原始資料說明 | `docs/DATA_README.md` |
 
