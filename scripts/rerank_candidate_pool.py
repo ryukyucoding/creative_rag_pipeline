@@ -146,6 +146,14 @@ def latest_pool_path() -> Path:
     return paths[0]
 
 
+def group_by_index(rows: list[dict[str, Any]]) -> dict[Any, list[dict[str, Any]]]:
+    groups: dict[Any, list[dict[str, Any]]] = {}
+    for row in rows:
+        key = row.get("index")
+        groups.setdefault(key, []).append(row)
+    return groups
+
+
 def main() -> None:
     input_path = Path(sys.argv[1]) if len(sys.argv) > 1 else latest_pool_path()
     if not input_path.is_absolute():
@@ -155,19 +163,38 @@ def main() -> None:
     if not rows:
         raise ValueError(f"No valid records in {input_path}")
 
-    result = rerank(rows)
-    out_path = output_path_for(input_path)
+    groups = group_by_index(rows)
+    is_batch = len(groups) > 1
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if is_batch:
+        out_path = RUNS_DIR / f"all_reranker_result_{timestamp}.jsonl"
+    else:
+        out_path = output_path_for(input_path)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    results = []
+    errors = []
+    for index, group_rows in sorted(groups.items()):
+        try:
+            results.append(rerank(group_rows))
+        except Exception as exc:
+            errors.append((index, str(exc)))
+            print(f"[WARN] index={index} skipped: {exc}", file=sys.stderr)
+
     with out_path.open("w", encoding="utf-8") as fh:
-        fh.write(json.dumps(result, ensure_ascii=False) + "\n")
+        for result in results:
+            fh.write(json.dumps(result, ensure_ascii=False) + "\n")
 
     print(f"Input : {input_path}")
     print(f"Output: {out_path}")
-    sel = result["selected"]
-    print(f"Selected: pool={sel['pool_variant']}, branch={sel['branch_id']}")
-    print("Ranking:")
-    for entry in result["ranking"]:
-        print(f"  #{entry['rank']} pool={entry['pool_variant']} branch={entry['branch_id']} | {entry['reason']}")
+    print(f"Processed: {len(results)} indices" + (f", {len(errors)} errors" if errors else ""))
+    if not is_batch:
+        sel = results[0]["selected"]
+        print(f"Selected: pool={sel['pool_variant']}, branch={sel['branch_id']}")
+        print("Ranking:")
+        for entry in results[0]["ranking"]:
+            print(f"  #{entry['rank']} pool={entry['pool_variant']} branch={entry['branch_id']} | {entry['reason']}")
 
 
 if __name__ == "__main__":
